@@ -20,6 +20,17 @@ except ImportError as exc:  # pragma: no cover - helpful startup message
         "The OpenAI Python client is required. Install it with 'pip install openai'."
     ) from exc
 
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:  # pragma: no cover
+    load_dotenv = None
+
+try:
+    # Optional: semantic retrieval via Supabase
+    from supabase.retriever import retrieve_context, format_context_for_prompt
+except Exception:
+    retrieve_context = None  # type: ignore
+    format_context_for_prompt = None  # type: ignore
 
 MODEL_NAME = "gpt-4o-mini"
 
@@ -30,6 +41,10 @@ class ContextChatApp:
     def __init__(self, master: tk.Tk) -> None:
         self.master = master
         master.title("OpenAI Context Window")
+
+        # Load .env if available
+        if load_dotenv is not None:
+            load_dotenv(override=False)
 
         self.client = OpenAI()
         self.history: list[dict[str, str]] = [
@@ -250,6 +265,32 @@ class ContextChatApp:
         """Send the conversation history to the model and return the reply."""
 
         messages = [{"role": msg["role"], "content": msg["content"]} for msg in self.history]
+
+        # Retrieval-augmented context from Supabase (best-effort)
+        try:
+            last_user = None
+            for m in reversed(self.history):
+                if m.get("role") == "user":
+                    last_user = m.get("content")
+                    break
+            if last_user and retrieve_context and format_context_for_prompt:
+                matches = retrieve_context(last_user, k=8, min_similarity=0.0)
+                context_text = format_context_for_prompt(matches)
+                if context_text:
+                    messages.insert(
+                        1,
+                        {
+                            "role": "system",
+                            "content": (
+                                "Use the following units data as factual context when answering. "
+                                "If relevant, cite unit fields (bloco/unidade/tipologia/row_id).\n\n"
+                                + context_text
+                            ),
+                        },
+                    )
+        except Exception:
+            # Silently ignore retrieval errors; fall back to normal chat
+            pass
 
         if hasattr(self.client, "responses"):
             response = self.client.responses.create(model=MODEL_NAME, input=messages)
