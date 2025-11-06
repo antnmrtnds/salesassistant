@@ -82,11 +82,19 @@ class ContextChatApp:
     def _query_model(self) -> str:
         """Send the conversation history to the model and return the reply."""
 
-        response = self.client.responses.create(
-            model=MODEL_NAME,
-            input=[{"role": msg["role"], "content": msg["content"]} for msg in self.history],
-        )
-        return response.output_text.strip()
+        messages = [{"role": msg["role"], "content": msg["content"]} for msg in self.history]
+
+        if hasattr(self.client, "responses"):
+            response = self.client.responses.create(model=MODEL_NAME, input=messages)
+            return response.output_text.strip()
+
+        # Fallback for older OpenAI Python SDK versions (<1.0)
+        completion = self.client.chat.completions.create(model=MODEL_NAME, messages=messages)
+        message = completion.choices[0].message
+        # "message" can be either a dict (legacy) or an object with a ``content`` attribute.
+        if isinstance(message, dict):
+            return (message.get("content") or "").strip()
+        return (getattr(message, "content", "") or "").strip()
 
     def _append_message(self, speaker: str, text: str) -> None:
         self.chat_display.configure(state=tk.NORMAL)
