@@ -46,6 +46,8 @@ class ContextChatApp:
         self._typing_anim_running: bool = False
         self._typing_anim_step: int = 0
         self._typing_after_id: str | None = None
+        self._typing_start_index: str | None = None
+        self._typing_end_index: str | None = None
 
     def _build_widgets(self) -> None:
         """Create the minimal UI controls."""
@@ -141,24 +143,27 @@ class ContextChatApp:
 
         self._typing_anim_running = True
         self._typing_anim_step = 0
+        self._typing_start_index = start_index
+        self._typing_end_index = end_index
         self._schedule_typing_animation()
 
     def _schedule_typing_animation(self) -> None:
-        if not self._typing_anim_running:
+        if not self._typing_anim_running or self._typing_start_index is None:
             return
-        ranges = self.chat_display.tag_ranges("typing_tag")
-        if len(ranges) >= 2:
-            start, end = ranges[0], ranges[1]
-            dots = "." * (self._typing_anim_step % 3 + 1)
-            text = f"Assistant: typing{dots}\n\n"
-            self.chat_display.configure(state=tk.NORMAL)
-            self.chat_display.delete(start, end)
-            self.chat_display.insert(start, text)
-            new_end = self.chat_display.index(f"{start}+{len(text)}c")
-            self.chat_display.tag_add("typing_tag", start, new_end)
-            self.chat_display.configure(state=tk.DISABLED)
-            self.chat_display.see(tk.END)
-            self._typing_anim_step += 1
+        start = self._typing_start_index
+        end = self._typing_end_index or start
+        dots = "." * (self._typing_anim_step % 3 + 1)
+        text = f"Assistant: typing{dots}\n\n"
+        self.chat_display.configure(state=tk.NORMAL)
+        self.chat_display.delete(start, end)
+        self.chat_display.insert(start, text)
+        new_end = self.chat_display.index(f"{start}+{len(text)}c")
+        self.chat_display.tag_remove("typing_tag", "1.0", tk.END)
+        self.chat_display.tag_add("typing_tag", start, new_end)
+        self.chat_display.configure(state=tk.DISABLED)
+        self.chat_display.see(tk.END)
+        self._typing_anim_step += 1
+        self._typing_end_index = new_end
         # Schedule next frame
         self._typing_after_id = self.master.after(500, self._schedule_typing_animation)
 
@@ -171,14 +176,14 @@ class ContextChatApp:
                 pass
             self._typing_after_id = None
         if self._typing_anim_running:
-            ranges = self.chat_display.tag_ranges("typing_tag")
-            if len(ranges) >= 2:
-                start, end = ranges[0], ranges[1]
-                self.chat_display.configure(state=tk.NORMAL)
-                self.chat_display.delete(start, end)
-                self.chat_display.configure(state=tk.DISABLED)
+            self.chat_display.configure(state=tk.NORMAL)
+            if self._typing_start_index and self._typing_end_index:
+                self.chat_display.delete(self._typing_start_index, self._typing_end_index)
+            self.chat_display.configure(state=tk.DISABLED)
             self.chat_display.tag_remove("typing_tag", "1.0", tk.END)
         self._typing_anim_running = False
+        self._typing_start_index = None
+        self._typing_end_index = None
 
     def _query_model(self) -> str:
         """Send the conversation history to the model and return the reply."""
