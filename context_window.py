@@ -42,12 +42,13 @@ class ContextChatApp:
         ]
 
         self._build_widgets()
-        # Typing placeholder animation state
-        self._typing_anim_running: bool = False
-        self._typing_anim_step: int = 0
-        self._typing_after_id: str | None = None
-        self._typing_start_index: str | None = None
-        self._typing_end_index: str | None = None
+        # Typing placeholder simple state (no animation)
+        self._typing_present: bool = False
+        # Prevent concurrent sends (Enter + Button, double taps)
+        self._inflight: bool = False
+        # Keep fallback indices for typing placeholder
+        self._typing_start_str: str | None = None
+        self._typing_end_str: str | None = None
 
     def _build_widgets(self) -> None:
         """Create the minimal UI controls."""
@@ -73,12 +74,16 @@ class ContextChatApp:
         self.master.rowconfigure(0, weight=1)
         self.master.columnconfigure(0, weight=1)
 
-    def _on_send(self, event: tk.Event | None = None) -> None:
+    def _on_send(self, event: tk.Event | None = None) -> str | None:
         """Send the current text to the model and display the response."""
 
         user_text = self.input_entry.get().strip()
         if not user_text:
-            return
+            return "break" if event is not None else None
+
+        # Ignore if a previous request is still in flight
+        if self._inflight:
+            return "break" if event is not None else None
 
         self.input_entry.delete(0, tk.END)
         # Show the user's message immediately in the chat window
@@ -87,9 +92,11 @@ class ContextChatApp:
 
         # Enter loading state and fetch response on a background thread
         self._set_loading(True, message="Assistant is typing...")
-        self._start_typing_placeholder()
+        self._insert_typing_placeholder()
+        self._inflight = True
         thread = threading.Thread(target=self._fetch_response, daemon=True)
         thread.start()
+        return "break" if event is not None else None
 
     def _fetch_response(self) -> None:
         """Background worker to query the model and dispatch UI updates back on the main thread."""
@@ -105,16 +112,21 @@ class ContextChatApp:
 
     def _on_response_ready(self, response_text: str) -> None:
         """Handle successful model response on the UI thread."""
-        self._remove_typing_placeholder()
+        # First, record in history
         self.history.append({"role": "assistant", "content": response_text})
-        self._append_message("Assistant", response_text)
+        # Prefer replacing the typing placeholder in place; fall back to append
+        replaced = self._replace_typing_with_response(response_text)
+        if not replaced:
+            self._append_message("Assistant", response_text)
         self._set_loading(False)
+        self._inflight = False
 
     def _on_response_error(self, error: Exception) -> None:  # pragma: no cover - user feedback only
         """Handle an error from the background request on the UI thread."""
         messagebox.showerror("OpenAI Error", str(error))
         self._remove_typing_placeholder()
         self._set_loading(False)
+        self._inflight = False
 
     def _set_loading(self, is_loading: bool, message: str | None = None) -> None:
         """Enable or disable UI loading state and optional status message."""
@@ -128,62 +140,111 @@ class ContextChatApp:
             self.send_button.configure(state=tk.NORMAL)
             self.status_var.set("")
 
-    def _start_typing_placeholder(self) -> None:
-        """Insert a placeholder line in the chat and start animating dots."""
-        if self._typing_anim_running:
+    def _insert_typing_placeholder(self) -> None:
+        """Insert a single, static typing line if not already present."""
+        if self._typing_present:
             return
         self.chat_display.configure(state=tk.NORMAL)
+        # Clean previous marks and tagged regions
+        try:
+            self.chat_display.mark_unset("typing_start")
+            self.chat_display.mark_unset("typing_end")
+        except Exception:
+            pass
+        try:
+            ranges = self.chat_display.tag_ranges("typing_tag")
+            if len(ranges) >= 2:
+                self.chat_display.delete(ranges[0], ranges[1])
+                self.chat_display.tag_remove("typing_tag", "1.0", tk.END)
+        except Exception:
+            pass
+        # Insert placeholder and set marks tightly around it
         start_index = self.chat_display.index(tk.END)
+        self._typing_start_str = start_index
+        self.chat_display.mark_set("typing_start", start_index)
+        self.chat_display.mark_gravity("typing_start", tk.LEFT)
         placeholder = "Assistant: typing...\n\n"
-        self.chat_display.insert(tk.END, placeholder)
-        end_index = self.chat_display.index(tk.END)
-        self.chat_display.tag_add("typing_tag", start_index, end_index)
+        self.chat_display.insert("typing_start", placeholder)
+        self.chat_display.mark_set("typing_end", f"typing_start+{len(placeholder)}c")
+        self.chat_display.mark_gravity("typing_end", tk.RIGHT)
+        self._typing_end_str = self.chat_display.index("typing_end")
+        self.chat_display.tag_add("typing_tag", "typing_start", "typing_end")
         self.chat_display.configure(state=tk.DISABLED)
         self.chat_display.see(tk.END)
-
-        self._typing_anim_running = True
-        self._typing_anim_step = 0
-        self._typing_start_index = start_index
-        self._typing_end_index = end_index
-        self._schedule_typing_animation()
-
-    def _schedule_typing_animation(self) -> None:
-        if not self._typing_anim_running or self._typing_start_index is None:
-            return
-        start = self._typing_start_index
-        end = self._typing_end_index or start
-        dots = "." * (self._typing_anim_step % 3 + 1)
-        text = f"Assistant: typing{dots}\n\n"
-        self.chat_display.configure(state=tk.NORMAL)
-        self.chat_display.delete(start, end)
-        self.chat_display.insert(start, text)
-        new_end = self.chat_display.index(f"{start}+{len(text)}c")
-        self.chat_display.tag_remove("typing_tag", "1.0", tk.END)
-        self.chat_display.tag_add("typing_tag", start, new_end)
-        self.chat_display.configure(state=tk.DISABLED)
-        self.chat_display.see(tk.END)
-        self._typing_anim_step += 1
-        self._typing_end_index = new_end
-        # Schedule next frame
-        self._typing_after_id = self.master.after(500, self._schedule_typing_animation)
+        self._typing_present = True
 
     def _remove_typing_placeholder(self) -> None:
-        """Remove the typing placeholder and stop the animation if running."""
-        if self._typing_after_id is not None:
+        """Remove the static typing line if present."""
+        if not self._typing_present:
+            return
+        self.chat_display.configure(state=tk.NORMAL)
+        try:
+            self.chat_display.delete("typing_start", "typing_end")
+            self.chat_display.tag_remove("typing_tag", "1.0", tk.END)
             try:
-                self.master.after_cancel(self._typing_after_id)
+                self.chat_display.mark_unset("typing_start")
+                self.chat_display.mark_unset("typing_end")
             except Exception:
                 pass
-            self._typing_after_id = None
-        if self._typing_anim_running:
+        except Exception:
+            pass
+        self.chat_display.configure(state=tk.DISABLED)
+        self._typing_present = False
+        self._typing_start_str = None
+        self._typing_end_str = None
+
+    def _replace_typing_with_response(self, response_text: str) -> bool:
+        """Replace the typing placeholder with the assistant's response in place.
+
+        Returns True if replacement occurred; otherwise False (no placeholder found).
+        """
+        try:
+            text = f"Assistant: {response_text}\n\n"
             self.chat_display.configure(state=tk.NORMAL)
-            if self._typing_start_index and self._typing_end_index:
-                self.chat_display.delete(self._typing_start_index, self._typing_end_index)
+            # 1) Try marks first
+            try:
+                self.chat_display.delete("typing_start", "typing_end")
+                self.chat_display.insert("typing_start", text)
+                replaced = True
+            except Exception:
+                replaced = False
+            # 2) Fallback to stored indices
+            if not replaced and self._typing_start_str and self._typing_end_str:
+                try:
+                    self.chat_display.delete(self._typing_start_str, self._typing_end_str)
+                    self.chat_display.insert(self._typing_start_str, text)
+                    replaced = True
+                except Exception:
+                    replaced = False
+            # 3) Fallback to search in text
+            if not replaced:
+                try:
+                    start_found = self.chat_display.search("Assistant: typing...", "1.0", tk.END)
+                    if start_found:
+                        end_found = self.chat_display.index(f"{start_found}+{len('Assistant: typing...\n\n')}c")
+                        self.chat_display.delete(start_found, end_found)
+                        self.chat_display.insert(start_found, text)
+                        replaced = True
+                except Exception:
+                    replaced = False
+
+            # Clear tag and marks if we replaced
+            if replaced:
+                self.chat_display.tag_remove("typing_tag", "1.0", tk.END)
+                try:
+                    self.chat_display.mark_unset("typing_start")
+                    self.chat_display.mark_unset("typing_end")
+                except Exception:
+                    pass
+                self._typing_present = False
+                self._typing_start_str = None
+                self._typing_end_str = None
             self.chat_display.configure(state=tk.DISABLED)
-            self.chat_display.tag_remove("typing_tag", "1.0", tk.END)
-        self._typing_anim_running = False
-        self._typing_start_index = None
-        self._typing_end_index = None
+            self.chat_display.see(tk.END)
+            return replaced
+        except Exception:
+            pass
+        return False
 
     def _query_model(self) -> str:
         """Send the conversation history to the model and return the reply."""
